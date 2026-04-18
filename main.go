@@ -1,123 +1,119 @@
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"interoperability-sdk-golang/interoperability_bridge_golang"
+	"math/rand"
 	"reflect"
-	"strings"
+	"time"
+
+	SDK "interoperability-sdk-golang/interoperability_bridge_golang"
 )
 
-// clean is the ultimate dynamic helper to handle single Enums, Slices, and Pointers
-func clean(v interface{}) interface{} {
-	rv := reflect.ValueOf(v)
+type Result struct {
+	Value interface{}
+	Error error
+}
 
-	// 1. Handle Pointers (dereference)
-	if rv.Kind() == reflect.Ptr {
-		if rv.IsNil() {
-			return nil
-		}
-		rv = rv.Elem()
-	}
-
-	// 2. Handle Slices (recursive clean for each item)
-	if rv.Kind() == reflect.Slice {
-		var list []interface{}
-		for i := 0; i < rv.Len(); i++ {
-			list = append(list, clean(rv.Index(i).Interface()))
-		}
-		return list
-	}
-
-	// 3. Handle single Enums (strip prefixes automatically)
-	s := fmt.Sprintf("%v", rv.Interface())
-	s = strings.TrimPrefix(s, "Language")
-	s = strings.TrimPrefix(s, "Integration")
-	s = strings.TrimPrefix(s, "Crates")
-	s = strings.TrimPrefix(s, "Developmentkit")
+func FetchPages(startPage, endPage int) []Result {
+	count := endPage - startPage + 1
+	results := make([]Result, count)
 	
-	// Handle nil/null cases from pointer dereferencing
-	if s == "<nil>" {
-		return nil
+	// Helper to create a *string for the bridge
+	strPtr := func(s string) *string { return &s }
+
+	type indexedResult struct {
+		index int
+		res   Result
 	}
-	return s
+	resChan := make(chan indexedResult, count)
+
+	for i := 0; i < count; i++ {
+		pageNum := startPage + i
+		go func(idx, page int) {
+			time.Sleep(time.Duration(rand.Intn(201)+50) * time.Millisecond)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			fetchDone := make(chan Result, 1)
+			go func() {
+				// Convert page int to string then to *string
+				pageStr := fmt.Sprintf("%d", page)
+				
+				params := SDK.FilterParams{
+					Page: strPtr(pageStr), 
+				}
+				res, err := SDK.FetchInteroperability(params)
+				fetchDone <- Result{Value: res, Error: err}
+			}()
+
+			select {
+			case <-ctx.Done():
+				resChan <- indexedResult{idx, Result{Error: fmt.Errorf("timeout exceeded")}}
+			case r := <-fetchDone:
+				resChan <- indexedResult{idx, r}
+			}
+		}(i, pageNum)
+	}
+
+	for i := 0; i < count; i++ {
+		ir := <-resChan
+		results[ir.index] = ir.res
+	}
+	return results
 }
 
 func main() {
-	fmt.Println("Golang SDK")
+	fmt.Println("--- Bhilani Interop SDK (Golang Concurrency) ---")
+	results := FetchPages(1, 5)
 
-	// 1. Setup Parameters
-	params := interoperability_bridge_golang.FilterParams{}
+	for i, res := range results {
+		pageNum := i + 1
+		if res.Error != nil {
+			fmt.Printf("Page %d: Failed (%v)\n", pageNum, res.Error)
+			continue
+		}
 
-	// 2. Call the Rust Bridge
-	result, err := interoperability_bridge_golang.FetchInteroperability(params)
-	if err != nil {
-		fmt.Printf("Error from Rust: %v\n", err)
-		return
+		v := reflect.ValueOf(res.Value)
+		for v.Kind() == reflect.Ptr { v = v.Elem() }
+
+		dataField := v.FieldByName("Data")
+		if dataField.IsValid() && dataField.Kind() == reflect.Slice {
+			itemCount := dataField.Len()
+			
+			if itemCount > 0 {
+				fmt.Printf("Page %d: Success\n", pageNum)
+				// Iterate through the slice of items
+				for j := 0; j < itemCount; j++ {
+					item := dataField.Index(j)
+					for item.Kind() == reflect.Ptr || item.Kind() == reflect.Interface {
+						item = item.Elem()
+					}
+					
+					// Extract and print the Title field
+					titleField := item.FieldByName("Title")
+					if titleField.IsValid() {
+						fmt.Printf("  - Title: %v\n", titleField.Interface())
+					}
+				}
+			} else {
+				// Get TotalPages for the "No Data" message
+				totalPages := 0
+				paginationField := v.FieldByName("Pagination")
+				if paginationField.IsValid() {
+					for paginationField.Kind() == reflect.Ptr { paginationField = paginationField.Elem() }
+					tpField := paginationField.FieldByName("TotalPages")
+					if tpField.IsValid() {
+						if tpField.Kind() >= reflect.Uint && tpField.Kind() <= reflect.Uint64 {
+							totalPages = int(tpField.Uint())
+						} else {
+							totalPages = int(tpField.Int())
+						}
+					}
+				}
+				fmt.Printf("Page %d: Success (No Data - Server has %d pages)\n", pageNum, totalPages)
+			}
+		}
 	}
-
-	fmt.Println(result.Message)
-
-	// 3. Map the data to include clean string names for Enums
-	var response []map[string]interface{}
-	for _, item := range result.Data {
-		response = append(response, map[string]interface{}{
-			"id":             item.Id,
-			"title":          item.Title,
-			"language":       clean(item.Language),
-			"integration":    clean(item.Integration),
-			"crates":         clean(item.Crates),
-			"developmentkit": clean(item.Developmentkit),
-			"opensources":    item.Opensources,
-		})
-	}
-
-	// 4. Final Pretty-Print
-	jsonData, err := json.MarshalIndent(response, "", "  ")
-	if err != nil {
-		fmt.Printf("❌ JSON Error: %v\n", err)
-		return
-	}
-
-	fmt.Println(string(jsonData))
 }
-
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
-//ramramjiramramjuramramji
