@@ -4,116 +4,139 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"reflect"
+	"runtime"
+	"sync"
 	"time"
 
 	SDK "interoperability-sdk-golang/interoperability_bridge_golang"
 )
 
-type Result struct {
-	Value interface{}
-	Error error
+type TimedResult struct {
+	PageNum  int
+	Response SDK.FilterResponse
+	Error    error
+	Duration int64
 }
 
-func FetchPages(startPage, endPage int) []Result {
+type GoSDKit struct {
+	isLibLoaded bool
+}
+
+func NewGoSDKit() *GoSDKit {
+	os := runtime.GOOS
+	arch := runtime.GOARCH
+
+	// Platform & Architecture Check
+	isSupportedOs := os == "windows" || os == "darwin" || os == "linux"
+	isSupportedArch := arch == "amd64" || arch == "arm64"
+
+	loaded := false
+	if isSupportedOs && isSupportedArch {
+		loaded = true
+	} else {
+		fmt.Printf("Unsupported platform: %s (%s). Native features disabled.\n", os, arch)
+	}
+
+	return &GoSDKit{isLibLoaded: loaded}
+}
+
+func (sdk *GoSDKit) IsReady() bool {
+	return sdk.isLibLoaded
+}
+
+func (sdk *GoSDKit) FetchPages(startPage, endPage int) []TimedResult {
 	count := endPage - startPage + 1
-	results := make([]Result, count)
-	
-	// Helper to create a *string for the bridge
+	results := make([]TimedResult, count)
+	var wg sync.WaitGroup
+
 	strPtr := func(s string) *string { return &s }
 
-	type indexedResult struct {
-		index int
-		res   Result
-	}
-	resChan := make(chan indexedResult, count)
-
 	for i := 0; i < count; i++ {
-		pageNum := startPage + i
-		go func(idx, page int) {
-			time.Sleep(time.Duration(rand.Intn(201)+50) * time.Millisecond)
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			pageNum := startPage + idx
 
+			if !sdk.isLibLoaded {
+				results[idx] = TimedResult{PageNum: pageNum, Error: fmt.Errorf("library not loaded")}
+				return
+			}
+
+			// Random delay logic (50ms to 250ms)
+			time.Sleep(time.Duration(rand.Intn(201)+50) * time.Millisecond)
+			startTime := time.Now()
+
+			// Timeout logic (5 seconds)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			fetchDone := make(chan Result, 1)
+			type bridgeRes struct {
+				res SDK.FilterResponse
+				err error
+			}
+			done := make(chan bridgeRes, 1)
+
 			go func() {
-				// Convert page int to string then to *string
-				pageStr := fmt.Sprintf("%d", page)
-				
-				params := SDK.FilterParams{
-					Page: strPtr(pageStr), 
-				}
+				params := SDK.FilterParams{Page: strPtr(fmt.Sprintf("%d", pageNum))}
 				res, err := SDK.FetchInteroperability(params)
-				fetchDone <- Result{Value: res, Error: err}
+				done <- bridgeRes{res, err}
 			}()
 
+			var finalRes bridgeRes
 			select {
 			case <-ctx.Done():
-				resChan <- indexedResult{idx, Result{Error: fmt.Errorf("timeout exceeded")}}
-			case r := <-fetchDone:
-				resChan <- indexedResult{idx, r}
+				finalRes = bridgeRes{err: fmt.Errorf("timeout exceeded")}
+			case r := <-done:
+				finalRes = r
 			}
-		}(i, pageNum)
+
+			results[idx] = TimedResult{
+				PageNum:  pageNum,
+				Response: finalRes.res,
+				Error:    finalRes.err,
+				Duration: time.Since(startTime).Milliseconds(),
+			}
+		}(i)
 	}
 
-	for i := 0; i < count; i++ {
-		ir := <-resChan
-		results[ir.index] = ir.res
-	}
+	wg.Wait()
 	return results
 }
 
 func main() {
-	fmt.Println("--- Bhilani Interop SDK (Golang Concurrency) ---")
-	results := FetchPages(1, 5)
+	sdk := NewGoSDKit()
+	totalStart := time.Now()
 
-	for i, res := range results {
-		pageNum := i + 1
-		if res.Error != nil {
-			fmt.Printf("Page %d: Failed (%v)\n", pageNum, res.Error)
+	fmt.Println("--- Bhilani Interop SDK (Golang Concurrency) ---")
+
+	if !sdk.IsReady() {
+		fmt.Println("Abort: Native library not loaded for this platform.")
+		return
+	}
+
+	results := sdk.FetchPages(1, 5)
+
+	for _, tr := range results {
+		if tr.Error != nil {
+			fmt.Printf("Page %d: Failed (%v) [%dms]\n", tr.PageNum, tr.Error, tr.Duration)
 			continue
 		}
 
-		v := reflect.ValueOf(res.Value)
-		for v.Kind() == reflect.Ptr { v = v.Elem() }
+		res := tr.Response
+		totalPages := 0
+		if res.Pagination != nil {
+			totalPages = int(res.Pagination.TotalPages)
+		}
 
-		dataField := v.FieldByName("Data")
-		if dataField.IsValid() && dataField.Kind() == reflect.Slice {
-			itemCount := dataField.Len()
-			
-			if itemCount > 0 {
-				fmt.Printf("Page %d: Success\n", pageNum)
-				// Iterate through the slice of items
-				for j := 0; j < itemCount; j++ {
-					item := dataField.Index(j)
-					for item.Kind() == reflect.Ptr || item.Kind() == reflect.Interface {
-						item = item.Elem()
-					}
-					
-					// Extract and print the Title field
-					titleField := item.FieldByName("Title")
-					if titleField.IsValid() {
-						fmt.Printf("  - Title: %v\n", titleField.Interface())
-					}
-				}
-			} else {
-				// Get TotalPages for the "No Data" message
-				totalPages := 0
-				paginationField := v.FieldByName("Pagination")
-				if paginationField.IsValid() {
-					for paginationField.Kind() == reflect.Ptr { paginationField = paginationField.Elem() }
-					tpField := paginationField.FieldByName("TotalPages")
-					if tpField.IsValid() {
-						if tpField.Kind() >= reflect.Uint && tpField.Kind() <= reflect.Uint64 {
-							totalPages = int(tpField.Uint())
-						} else {
-							totalPages = int(tpField.Int())
-						}
-					}
-				}
-				fmt.Printf("Page %d: Success (No Data - Server has %d pages)\n", pageNum, totalPages)
+		if len(res.Data) == 0 || tr.PageNum > totalPages {
+			fmt.Printf("Page %d: Success (No Data) [%dms]\n", tr.PageNum, tr.Duration)
+		} else {
+			fmt.Printf("Page %d: Success [%dms]\n", tr.PageNum, tr.Duration)
+			for _, item := range res.Data {
+				fmt.Printf("  - Title: %s\n", item.Title)
 			}
 		}
 	}
+
+	fmt.Printf("\nTotal session duration: %dms\n", time.Since(totalStart).Milliseconds())
 }

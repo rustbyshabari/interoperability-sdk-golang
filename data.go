@@ -68,14 +68,14 @@ func main() {
 			"integration":    clean(item.Integration),
 			"crates":         clean(item.Crates),
 			"developmentkit": clean(item.Developmentkit),
-			//"opensources":    item.Opensources,
+			"opensources":    item.Opensources,
 		})
 	}
 
 	// 4. Final Pretty-Print
 	jsonData, err := json.MarshalIndent(response, "", "  ")
 	if err != nil {
-		fmt.Printf("❌ JSON Error: %v\n", err)
+		fmt.Printf("JSON Error: %v\n", err)
 		return
 	}
 
