@@ -6,7 +6,7 @@ Run SDK
 
 Basic Usage
 
-package main
+    package main
 
     import (
     	"fmt"
